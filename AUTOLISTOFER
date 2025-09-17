@@ -1,0 +1,247 @@
+using Autodesk.AutoCAD.ApplicationServices;
+using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.EditorInput;
+using Autodesk.AutoCAD.Geometry;
+using Autodesk.AutoCAD.Runtime;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Excel = Microsoft.Office.Interop.Excel;
+
+namespace RebarListPlugin
+{
+    public class RebarListGenerator
+    {
+        [CommandMethod("GENREBARLIST")]
+        public void GenerateRebarList()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            try
+            {
+                // درخواست از کاربر برای انتخاب یک نقطه روی نقشه
+                PromptPointResult ppr = ed.GetPoint("\nلطفاً روی نقشه سازه کلیک کنید: ");
+                if (ppr.Status != PromptStatus.OK) return;
+
+                Point3d selectedPoint = ppr.Value;
+
+                // جمع‌آوری اطلاعات میلگردها از نقشه
+                List<RebarInfo> rebarList = CollectRebarInfo(db, selectedPoint);
+
+                // تولید لیستوفر در اکسل
+                GenerateExcelList(rebarList);
+
+                ed.WriteMessage("\nلیستوفر میلگرد با موفقیت ایجاد شد.");
+            }
+            catch (Exception ex)
+            {
+                ed.WriteMessage($"\nخطا: {ex.Message}");
+            }
+        }
+
+        private List<RebarInfo> CollectRebarInfo(Database db, Point3d selectionPoint)
+        {
+            List<RebarInfo> rebarList = new List<RebarInfo>();
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                BlockTable bt = tr.GetObject(db.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord btr = tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead) as BlockTableRecord;
+
+                foreach (ObjectId objId in btr)
+                {
+                    // بررسی انواع مختلف اشیاء برای تشخیص میلگرد
+                    if (objId.ObjectClass.DxfName == "TEXT" || objId.ObjectClass.DxfName == "MTEXT")
+                    {
+                        DBText text = tr.GetObject(objId, OpenMode.ForRead) as DBText;
+                        if (text != null && IsNearPoint(text.Position, selectionPoint, 1000))
+                        {
+                            RebarInfo rebar = ParseRebarInfo(text.TextString, text.Position);
+                            if (rebar != null)
+                                rebarList.Add(rebar);
+                        }
+                    }
+                    else if (objId.ObjectClass.DxfName == "LINE" || objId.ObjectClass.DxfName == "POLYLINE")
+                    {
+                        Entity entity = tr.GetObject(objId, OpenMode.ForRead) as Entity;
+                        if (entity != null && IsNearPoint(entity.Bounds.Value.MinPoint, selectionPoint, 1000))
+                        {
+                            // تشخیص میلگرد بر اساس خطوط با الگوی خاص
+                            RebarInfo rebar = DetectRebarFromLine(entity);
+                            if (rebar != null)
+                                rebarList.Add(rebar);
+                        }
+                    }
+                    // افزودن تشخیص سایر اشیاء مرتبط
+                }
+
+                tr.Commit();
+            }
+
+            return rebarList;
+        }
+
+        private bool IsNearPoint(Point3d point1, Point3d point2, double tolerance)
+        {
+            return point1.DistanceTo(point2) < tolerance;
+        }
+
+        private RebarInfo ParseRebarInfo(string text, Point3d position)
+        {
+            // الگوی تشخیص میلگرد بر اساس مقررات ملی ساختمان ایران
+            string pattern = @"[ΦØ](\d+)\s*[×*]?\s*(\d+)\s*[×*]?\s*(\d+)\s*(?:@\s*(\d+))?";
+            var match = System.Text.RegularExpressions.Regex.Match(text, pattern);
+            
+            if (match.Success)
+            {
+                double diameter = double.Parse(match.Groups[1].Value);
+                int count = int.Parse(match.Groups[2].Value);
+                double length = double.Parse(match.Groups[3].Value);
+                
+                // محاسبه طول واقعی با در نظر گرفتن خم‌ها بر اساس مبحث نهم
+                double actualLength = CalculateActualLength(length, diameter);
+                
+                return new RebarInfo
+                {
+                    Diameter = diameter,
+                    Length = actualLength,
+                    Count = count,
+                    Position = position,
+                    Description = text,
+                    Bends = CalculateBends(length, diameter)
+                };
+            }
+            
+            return null;
+        }
+
+        private RebarInfo DetectRebarFromLine(Entity entity)
+        {
+            // تشخیص میلگرد از روی خطوط با الگوی خاص
+            // این بخش نیاز به توسعه بیشتر با توجه به استانداردهای نقشه‌کشی دارد
+            return null;
+        }
+
+        private double CalculateActualLength(double nominalLength, double diameter)
+        {
+            // محاسبه طول واقعی میلگرد با در نظر گرفتن خم‌ها بر اساس مبحث نهم
+            // ضرایب خم‌ها بر اساس استاندارد 2800 ایران
+            double bendDeduction = 0;
+
+            // برای هر خم، مقدار کسر بر اساس قطر میلگرد و زاویه خم
+            if (diameter <= 16)
+            {
+                bendDeduction = diameter * 2; // برای میلگردهای نازک
+            }
+            else
+            {
+                bendDeduction = diameter * 2.5; // برای میلگردهای ضخیم
+            }
+
+            return nominalLength - bendDeduction;
+        }
+
+        private int CalculateBends(double length, double diameter)
+        {
+            // محاسبه تعداد خم‌ها بر اساس طول و قطر میلگرد
+            // این یک الگوی ساده است و باید با استانداردهای دقیق‌تر جایگزین شود
+            if (length > 6000) return 3;
+            if (length > 3000) return 2;
+            if (length > 1000) return 1;
+            return 0;
+        }
+
+        private void GenerateExcelList(List<RebarInfo> rebarList)
+        {
+            Excel.Application excelApp = new Excel.Application();
+            excelApp.Visible = true;
+            Excel.Workbook workbook = excelApp.Workbooks.Add();
+            Excel.Worksheet worksheet = workbook.ActiveSheet;
+
+            // ایجاد هدر جدول
+            worksheet.Cells[1, 1] = "ردیف";
+            worksheet.Cells[1, 2] = "قطر (میلی‌متر)";
+            worksheet.Cells[1, 3] = "طول اسمی (میلی‌متر)";
+            worksheet.Cells[1, 4] = "طول واقعی (میلی‌متر)";
+            worksheet.Cells[1, 5] = "تعداد";
+            worksheet.Cells[1, 6] = "تعداد خم‌ها";
+            worksheet.Cells[1, 7] = "وزن واحد (کیلوگرم)";
+            worksheet.Cells[1, 8] = "وزن کل (کیلوگرم)";
+            worksheet.Cells[1, 9] = "توضیحات";
+
+            // فرمت‌دهی هدر
+            Excel.Range headerRange = worksheet.Range["A1", "I1"];
+            headerRange.Interior.Color = Excel.XlRgbColor.rgbLightGray;
+            headerRange.Font.Bold = true;
+
+            // پر کردن داده‌ها
+            double totalWeight = 0;
+            for (int i = 0; i < rebarList.Count; i++)
+            {
+                RebarInfo rebar = rebarList[i];
+                double unitWeight = CalculateUnitWeight(rebar.Diameter, rebar.Length);
+                double totalItemWeight = unitWeight * rebar.Count;
+                totalWeight += totalItemWeight;
+
+                worksheet.Cells[i + 2, 1] = i + 1;
+                worksheet.Cells[i + 2, 2] = rebar.Diameter;
+                worksheet.Cells[i + 2, 3] = rebar.Length + (rebar.Bends * rebar.Diameter * 2); // طول اسمی
+                worksheet.Cells[i + 2, 4] = rebar.Length; // طول واقعی
+                worksheet.Cells[i + 2, 5] = rebar.Count;
+                worksheet.Cells[i + 2, 6] = rebar.Bends;
+                worksheet.Cells[i + 2, 7] = Math.Round(unitWeight, 2);
+                worksheet.Cells[i + 2, 8] = Math.Round(totalItemWeight, 2);
+                worksheet.Cells[i + 2, 9] = rebar.Description;
+            }
+
+            // افزودن جمع کل
+            worksheet.Cells[rebarList.Count + 2, 7] = "جمع کل:";
+            worksheet.Cells[rebarList.Count + 2, 8] = Math.Round(totalWeight, 2) + " کیلوگرم";
+
+            // فرمت‌دهی سلول‌ها
+            Excel.Range dataRange = worksheet.Range["A2", $"I{rebarList.Count + 1}"];
+            dataRange.Borders.LineStyle = Excel.XlLineStyle.xlContinuous;
+
+            // تنظیم عرض ستون‌ها
+            worksheet.Columns.AutoFit();
+
+            // ذخیره فایل
+            string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            string filePath = Path.Combine(desktopPath, "لیستوفر_میلگرد.xlsx");
+            workbook.SaveAs(filePath);
+
+            // رها کردن منابع
+            workbook.Close();
+            excelApp.Quit();
+
+            System.Runtime.InteropServices.Marshal.ReleaseComObject(worksheet);
+            System.Runtime.InteropServices.Marshal.ReleaseComObject(workbook);
+            System.Runtime.InteropServices.Marshal.ReleaseComObject(excelApp);
+        }
+
+        private double CalculateUnitWeight(double diameter, double length)
+        {
+            // محاسبه وزن میلگرد بر اساس مبحث نهم مقررات ملی
+            // وزن بر حسب کیلوگرم = (قطر^2 / 162) * طول / 1000
+            return (Math.Pow(diameter, 2) / 162) * (length / 1000);
+        }
+    }
+
+    public class RebarInfo
+    {
+        public double Diameter { get; set; }
+        public double Length { get; set; }
+        public int Count { get; set; }
+        public Point3d Position { get; set; }
+        public string Description { get; set; }
+        public int Bends { get; set; }
+
+
+
+
+
+
+    }
+}
